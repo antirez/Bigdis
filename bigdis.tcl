@@ -1,0 +1,311 @@
+# BIGDIS -- A filesystem based DB speaking the Redis protocol for large files.
+#
+# Copyright (c) 2006-2009, Salvatore Sanfilippo
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright
+#      notice, this list of conditions and the following disclaimer in the
+#      documentation and/or other materials provided with the distribution.
+#    * Neither the name of Redis nor the names of its contributors may be
+#      used to endorse or promote products derived from this software
+#      without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+array set ::clients {}
+array set ::state {}
+array set ::readlen {}
+array set ::bulkfile {}
+array set ::bulkfd {}
+array set ::replyqueue {}
+set ::listensocket {}
+set ::tmpfileid 0
+
+source bigdis.conf
+
+package require sha1 2.0.0
+
+proc sha1_hex str {
+    ::sha1::sha1 -hex $str
+}
+
+proc log msg {
+    puts stderr "[clock format [clock seconds]]\] $msg "
+}
+
+proc warning msg {
+    log "*** WARNING: $msg"
+}
+
+proc wakeup_writable_handler fd {
+    if {[llength $::replyqueue($fd)] == 0} {
+        fileevent $fd writable [list write_reply $fd]
+    }
+}
+
+proc add_reply_raw {fd msg} {
+    wakeup_writable_handler $fd
+    lappend ::replyqueue($fd) [list buf $msg]
+}
+
+proc add_reply {fd msg} {
+    add_reply_raw $fd "$msg\r\n"
+}
+
+proc add_reply_int {fd int} {
+    add_reply $fd ":$int"
+}
+
+proc add_reply_file {fd filename} {
+    wakeup_writable_handler $fd
+    set keyfd [open $filename]
+    seek $keyfd 0 end
+    set len [tell $keyfd]
+    seek $keyfd 0
+    lappend ::replyqueue($fd) [list buf "$len\r\n"]
+    lappend ::replyqueue($fd) [list file $keyfd]
+}
+
+proc get_tmp_file {} {
+    file join $::root tmp temp_[incr ::tmpfileid]
+}
+
+proc file_for_key {key} {
+    set sha1 [sha1_hex $key]
+    file join $::root [string range $sha1 0 1] [string range $sha1 2 3] $sha1
+}
+
+proc create_dir_for_key {key} {
+    set sha1 [sha1_hex $key]
+    set dir1 [file join $::root [string range $sha1 0 1]]
+    set dir2 [file join $dir1 [string range $sha1 2 3]]
+    catch {file mkdir $dir1}
+    catch {file mkdir $dir2}
+}
+
+proc create_key_from_bulk {fd key} {
+    # Try to move the file in an optimistic way like if the two directories
+    # already exist. Otherwise create it and retry... in the long run there is
+    # an high probability that the directory exists as there are just 65563
+    # dirs in the database.
+    if {[catch {
+        file rename -force -- $::bulkfile($fd) [file_for_key $key]
+    }]} {
+        create_dir_for_key $key
+        file rename -force -- $::bulkfile($fd) [file_for_key $key]
+    }
+}
+
+proc update_last_interaction {fd} {
+    set ::clients($fd) [clock seconds]
+}
+
+proc reset_client {fd} {
+    if {![info exists ::clients($fd)]} return
+    update_last_interaction $fd
+    set ::state($fd) {}
+    set ::readlen($fd) -1
+    if {$::bulkfd($fd) ne {}} {
+        close $::bulkfd($fd)
+    }
+    if {$::bulkfile($fd) ne {}} {
+        file delete -- $::bulkfile($fd)
+    }
+    set ::bulkfile($fd) {}
+    set ::bulkfd($fd) {}
+}
+
+proc init_client {fd} {
+    update_last_interaction $fd
+    set ::state($fd) {}
+    set ::readlen($fd) -1
+    set ::bulkfile($fd) {}
+    set ::bulkfd($fd) {}
+    set ::replyqueue($fd) {}
+}
+
+proc close_client fd {
+    reset_client $fd
+    unset ::clients($fd)
+    unset ::state($fd)
+    unset ::readlen($fd)
+    unset ::bulkfile($fd)
+    unset ::bulkfd($fd)
+    for {set j 0} {$j < [llength $::replyqueue($fd)]} {incr j} {
+        set item [lindex $::replyqueue($fd)]
+        if {[lindex $item 0] eq {file}} {
+            close [lindex $item 1]
+        }
+    }
+    unset ::replyqueue($fd)
+    close $fd
+}
+
+proc accept {fd addr port} {
+    init_client $fd
+    fconfigure $fd -blocking 0 -translation binary -encoding binary
+    fileevent $fd readable [list read_request $fd]
+}
+
+proc read_request fd {
+    if [eof $fd] {
+        close_client $fd
+        return
+    }
+
+    # Handle bulk read
+    if {$::state($fd) ne {}} {
+        while {$::readlen($fd)} {
+            set readlen $::readlen($fd)
+            if {$readlen > 4096} {set readlen 4096}
+            set buf [read $fd $readlen]
+            if {$buf eq {}} break
+            puts -nonewline $::bulkfd($fd) $buf
+            incr ::readlen($fd) -[string length $buf]
+        }
+        if {$::readlen($fd) == 0} {
+            lappend ::state($fd) $::bulkfile($fd)
+            cmd_[string tolower [lindex $::state($fd) 0]] $fd $::state($fd)
+            reset_client $fd
+        }
+        return
+    }
+
+    # Handle first line request
+    set req [string trim [gets $fd] "\r\n "]
+    if {$req eq {}} return
+
+    # Process command
+    set args [split $req]
+    set cmd [string tolower [lindex $args 0]]
+    foreach ct $::cmdtable {
+        if {$cmd eq [lindex $ct 0] && [llength $args] == [lindex $ct 1]} {
+            if {[lindex $ct 2] eq {inline}} {
+                cmd_$cmd $fd $args
+                reset_client $fd
+            } else {
+                set readlen [lindex $args end]
+                if {$readlen < 0} {
+                    add_reply $fd "-ERR invalid bulk read length in protocol"
+                    close_client $fd
+                    return
+                }
+                setup_bulk_read $fd [lrange $args 0 end-1] $readlen
+                set ::bulkfile($fd) [get_tmp_file]
+                set ::bulkfd($fd) [open $::bulkfile($fd) w]
+            }
+            return
+        }
+    }
+    add_reply $fd "-ERR protocol error: invalid command or arity for '$cmd'"
+    reset_client $fd
+}
+
+proc write_reply fd {
+    while 1 {
+        if {[llength $::replyqueue($fd)] == 0} {
+            fileevent $fd writable {}
+            return;
+        }
+        set q [lrange $::replyqueue($fd) 1 end]
+        set item [lindex $::replyqueue($fd) 0]
+        set type [lindex $item 0]
+        set value [lindex $item 1]
+
+        if {$type eq {buf}} {
+            puts -nonewline $fd $value
+            flush $fd
+            set ::replyqueue($fd) $q ;# Consume the item
+            continue
+        } else {
+            set buf [read $value 16384]
+            if {$buf eq {}} {
+                set ::replyqueue($fd) $q ;# Consume the item
+                close $value
+            } else {
+                puts -nonewline $fd $buf
+                flush $fd
+                break
+            }
+        }
+    }
+}
+
+proc setup_bulk_read {fd argv len} {
+    set ::state($fd) $argv
+    set ::readlen($fd) [expr {$len+2}]  ;# Add two bytes for CRLF
+}
+
+proc cron {} {
+    # Todo timeout clients timeout
+    log "bigdis: [array size ::db] keys, [array size ::clients] clients"
+    after 1000 cron
+}
+
+set ::cmdtable {
+    {ping 1 inline}
+    {quit 1 inline}
+    {set 3 bulk}
+    {get 2 inline}
+    {exists 2 inline}
+    {del 2 inline}
+    {incrby 2 inline}
+    {append 3 bulk}
+    {substr 3 inline}
+}
+
+proc cmd_ping {fd argv} {
+    add_reply $fd "+PONG"
+}
+
+proc cmd_quit {fd argv} {
+    add_reply $fd "+BYE"
+    close_client $fd
+}
+
+proc cmd_exists {fd argv} {
+    add_reply_int $fd [file exists [file_for_key [lindex $argv 1]]]
+}
+
+proc cmd_set {fd argv} {
+    create_key_from_bulk $fd [lindex $argv 1]
+    add_reply $fd "+OK"
+}
+
+proc cmd_get {fd argv} {
+    set filename [file_for_key [lindex $argv 1]]
+    if {![file exists $filename]} {
+        add_reply $fd "$-1"
+    } else {
+        add_reply_file $fd $filename
+    }
+}
+
+proc initialize {} {
+    file mkdir [file join $::root tmp]
+    set ::listensocket [socket -server accept 6379]
+}
+
+proc main {} {
+    log "Server started"
+    initialize
+    cron
+}
+
+main
+vwait forever
