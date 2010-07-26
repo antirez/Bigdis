@@ -162,6 +162,7 @@ proc read_request fd {
         if {$::bulkfd($fd) eq {}} {
             set ::bulkfile($fd) [get_tmp_file]
             set ::bulkfd($fd) [open $::bulkfile($fd) w]
+            fconfigure $::bulkfd($fd) -translation binary -encoding binary
         }
         # Read current argument on file
         while {$::readlen($fd)} {
@@ -265,6 +266,7 @@ proc add_reply_int {fd int} {
 proc add_reply_file {fd filename} {
     wakeup_writable_handler $fd
     set keyfd [open $filename]
+    fconfigure $keyfd -translation binary -encoding binary
     seek $keyfd 0 end
     set len [tell $keyfd]
     seek $keyfd 0
@@ -327,6 +329,7 @@ proc key_del {key} {
 
 proc key_get_content {key} {
     set fd [open [file_for_key $key]]
+    fconfigure $fd -translation binary -encoding binary
     set buf [read $fd]
     close $fd
     return $buf
@@ -340,6 +343,7 @@ proc key_set_content {key buf} {
         create_dir_for_key $key
         set fd [open $tmpfile w]
     }
+    fconfigure $fd -translation binary -encoding binary
     puts -nonewline $fd $buf
     close $fd
     file rename -force -- $tmpfile [file_for_key $key]
