@@ -1,2 +1,3 @@
-- Cron with cleanup of timedout clients
+- Close connections of timed out clients
 - HTTP interface to access keys
+- APPEND, SUBSTR commands
