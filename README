@@ -1,0 +1,73 @@
+BIGDIS README
+=============
+
+Welcome to Bigdis! The Redis ugly brother...
+
+Bigdis is a weekend experiment about writing a Redis "clone" implementing a
+very strict subset of Redis commands (plain key-value basically) and using
+the file system as back end, that is: every key is represented as a file.
+
+What is the goal of such a monster you may ask? Short answer: storing very
+large values.
+
+Many kind of DBs are not well suited for storing large "files" as values. I mean
+things like images, or videos, and so forth. Still in the web-scale era it is
+very convenient to be able to access this kind of objects in a distributed
+fashion, with a networking layer, possibly with a protocol that contains
+already a large number of tested implementations.
+
+Such a protocol can be indeed the Redis protocol: it's simple to implement
+and good enough to transfer large data files without too much overhead.
+
+So I wrote this simple proof-of-concept implementation of "Bigdis".
+
+WARNING: this is just an hack I wrote in a few hours in a weekend where there
+was too wind to go to the sea. Don't use it in production without testing it
+and possibly fixing it properly. I'm looking for a team of open source
+developers interested in developing this project further, since I need to
+focus on Redis itself ;)
+
+HOW IT WORKS
+============
+
+Bigdis implements the new Redis multi-bulk protocol, so it does not work
+with old client libraries.
+
+Every key is stored as a file having as name the hexadecimal SHA1 of the key
+name itself.
+
+For instance the key "foo" will be stored as a file named:
+
+    0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33
+
+The first four bytes, in groups of two, are used to locate the directory
+where the file is located, so the full path for the above key is actually:
+
+   /db-root/0b/ee/0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33
+
+So there are a total of 65536 directories holding the actual keys. This is
+useful as filesystems may not handle very well a lot of files inside a
+single directory.
+
+Keys are created in an atomic fashion using the rename(2) command.
+
+During transfers of bulk values, a temp file is used, so even if you transfer
+a multi-gigabyte value, there is no need to use a lot of RAM in the server
+running Bigdis.
+
+USING BIGDIS
+============
+
+Edit bigdis.conf to setup the location of your DB, then execute bigdis
+with the following command:
+
+    tclsh bigdis.tcl
+
+Use any Redis client supporting the new protocol to talk with it.
+
+FUTURE
+======
+
+Do you think this idea is useful? Are you interested in developing it further?
+Drop me an email. Maybe it can be interesting to port it into Ruby/EM so that
+there will be more developers that can hack on it.
