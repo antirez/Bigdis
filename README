@@ -23,9 +23,8 @@ So I wrote this simple proof-of-concept implementation of "Bigdis".
 
 WARNING: this is just an hack I wrote in a few hours in a weekend where there
 was too wind to go to the sea. Don't use it in production without testing it
-and possibly fixing it properly. I'm looking for a team of open source
-developers interested in developing this project further, since I need to
-focus on Redis itself ;)
+and possibly fixing it properly. I'll likely don't have time to continue
+hacking on it so if you are interested please drop me an email.
 
 HOW IT WORKS
 ============
